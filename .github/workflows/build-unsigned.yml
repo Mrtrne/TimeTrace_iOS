@@ -1,0 +1,46 @@
+name: Build Unsigned IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: xcode-27
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build archive (unsigned)
+        run: |
+          xcodebuild archive \
+            -project TimeTrace-iOS.xcodeproj \
+            -scheme TimeTrace-iOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath $RUNNER_TEMP/TimeTrace-iOS.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER=""
+
+      - name: Package into unsigned IPA
+        run: |
+          cd $RUNNER_TEMP
+          mkdir -p Payload
+          cp -R TimeTrace-iOS.xcarchive/Products/Applications/TimeTrace-iOS.app Payload/
+          zip -r TimeTrace-iOS-unsigned.ipa Payload
+          ls -lh TimeTrace-iOS-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: ${{ runner.temp }}/TimeTrace-iOS-unsigned.ipa
