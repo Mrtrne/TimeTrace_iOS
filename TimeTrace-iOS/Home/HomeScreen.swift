@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import UniformTypeIdentifiers
 
 // 这个文件是首页时间轴
 struct HomeScreen: View {
@@ -19,6 +20,15 @@ struct HomeScreen: View {
     @State private var detailEvent: DateEvent?
     // 添加按钮弹跳计数
     @State private var addButtonBounce = 0
+    // 长按卡片进入的排序模式（手机列表用编辑模式拖动排序）
+    @State private var editMode: EditMode = .inactive
+    // 平板网格正在拖动的卡片编号
+    @State private var draggingEventId: Int64?
+    // 进入排序模式的震动触发计数
+    @State private var sortFeedbackTrigger = 0
+
+    // 是否正在排序
+    private var isSorting: Bool { editMode.isEditing }
 
     @Environment(\.horizontalSizeClass) private var sizeClass
     // 判断留不留毛玻璃
@@ -101,6 +111,7 @@ struct HomeScreen: View {
             }
         }
         .sensoryFeedback(.impact(weight: .heavy), trigger: pendingDelete?.id)
+        .sensoryFeedback(.impact(weight: .medium), trigger: sortFeedbackTrigger)
     }
 
     // 缝柔化
@@ -148,6 +159,31 @@ struct HomeScreen: View {
                     .foregroundStyle(TimeTracePalette.onSurface)
             }
             Spacer()
+            if isSorting {
+                // 排序模式下添加按钮换成完成按钮，点它退出排序
+                Button(action: {
+                    withAnimation { editMode = .inactive }
+                }) {
+                    Group {
+                        if #available(iOS 26.0, *) {
+                            Text(L("complete"))
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(TimeTracePalette.primary)
+                                .padding(.horizontal, 14)
+                                .frame(height: 36)
+                                .glassEffect(.regular, in: Capsule())
+                        } else {
+                            Text(L("complete"))
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(TimeTracePalette.primary)
+                                .padding(.horizontal, 14)
+                                .frame(height: 36)
+                                .background(.ultraThinMaterial, in: Capsule())
+                        }
+                    }
+                }
+                .accessibilityLabel(L("complete"))
+            } else {
             // 添加按钮，26及以上用官方液态玻璃，老的系统退回普通毛玻璃
             Button(action: {
                 addButtonBounce += 1
@@ -171,6 +207,7 @@ struct HomeScreen: View {
                 .symbolEffect(.bounce, value: addButtonBounce)   // 点击弹跳
             }
             .accessibilityLabel("add")
+            }
         }
         .padding(.horizontal, 16)
         .frame(maxWidth: .infinity)
@@ -188,10 +225,19 @@ struct HomeScreen: View {
             ForEach(pinnedEvents) { event in
                 cardRow(event: event, isPinned: true)
             }
+            // 排序模式下拖动改顺序，只在置顶组内部换位
+            .onMove { source, destination in
+                movePinned(fromOffsets: source, toOffset: destination)
+            }
             ForEach(normalEvents) { event in
                 cardRow(event: event, isPinned: false)
             }
+            // 排序模式下拖动改顺序，只在普通组内部换位
+            .onMove { source, destination in
+                moveNormal(fromOffsets: source, toOffset: destination)
+            }
         }
+        .environment(\.editMode, $editMode)
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
         .background(Color.clear)
@@ -255,6 +301,11 @@ struct HomeScreen: View {
             }
             .tint(.red)
         }
+        // 长按卡片进入排序模式，再拖动换顺序
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.5)
+                .onEnded { _ in enterSortMode() }
+        )
     }
 
     // 平板上用的双列网格
@@ -269,11 +320,29 @@ struct HomeScreen: View {
                     spacing: 16
                 ) {
                     ForEach(all) { event in
-                        if event.isPinned {
-                            PinnedEventCard(event: event) { open(event) }
-                        } else {
-                            NormalEventCard(event: event) { open(event) }
+                        Group {
+                            if event.isPinned {
+                                PinnedEventCard(event: event) { open(event) }
+                            } else {
+                                NormalEventCard(event: event) { open(event) }
+                            }
                         }
+                        // 长按拖动排序：拖起的卡片半透明，拖到同组卡片上实时换位
+                        .opacity(draggingEventId == event.id ? 0.4 : 1)
+                        .onDrag {
+                            draggingEventId = event.id
+                            return NSItemProvider(object: String(event.id) as NSString)
+                        }
+                        .onDrop(
+                            of: [.text],
+                            delegate: CardReorderDropDelegate(
+                                target: event,
+                                draggingEventId: $draggingEventId,
+                                onReorder: { draggedId, target in
+                                    moveEvent(draggedId: draggedId, onto: target)
+                                }
+                            )
+                        )
                     }
                 }
                 .padding(EdgeInsets(top: 16, leading: 16, bottom: 120, trailing: 16))
@@ -292,7 +361,61 @@ struct HomeScreen: View {
 
     // 点卡片进全屏详情页捏
     private func open(_ event: DateEvent) {
+        // 排序模式下点卡片不进详情
+        guard !isSorting else { return }
         detailEvent = event
+    }
+
+    // 长按卡片进入排序模式
+    private func enterSortMode() {
+        guard !isSorting else { return }
+        sortFeedbackTrigger += 1
+        withAnimation { editMode = .active }
+    }
+
+    // 置顶组内拖动排序
+    private func movePinned(fromOffsets source: IndexSet, toOffset destination: Int) {
+        var pinned = pinnedEvents
+        pinned.move(fromOffsets: source, toOffset: destination)
+        applyOrder(pinned: pinned, normal: normalEvents)
+    }
+
+    // 普通组内拖动排序
+    private func moveNormal(fromOffsets source: IndexSet, toOffset destination: Int) {
+        var normal = normalEvents
+        normal.move(fromOffsets: source, toOffset: destination)
+        applyOrder(pinned: pinnedEvents, normal: normal)
+    }
+
+    // 平板网格：把拖动的卡片移到目标卡片的位置，只在同组内换位
+    private func moveEvent(draggedId: Int64, onto target: DateEvent) {
+        guard draggedId != target.id,
+              let dragged = events.first(where: { $0.id == draggedId }),
+              dragged.isPinned == target.isPinned else { return }
+        var pinned = pinnedEvents
+        var normal = normalEvents
+        if dragged.isPinned {
+            moveWithin(&pinned, dragged: dragged, onto: target)
+        } else {
+            moveWithin(&normal, dragged: dragged, onto: target)
+        }
+        applyOrder(pinned: pinned, normal: normal)
+    }
+
+    private func moveWithin(_ group: inout [DateEvent], dragged: DateEvent, onto target: DateEvent) {
+        guard let from = group.firstIndex(where: { $0.id == dragged.id }),
+              let to = group.firstIndex(where: { $0.id == target.id }),
+              from != to else { return }
+        group.remove(at: from)
+        group.insert(dragged, at: to)
+    }
+
+    // 按屏幕上的显示顺序（置顶在前、组内按拖动结果）把 position 重新编号写回，排序才能持久化
+    private func applyOrder(pinned: [DateEvent], normal: [DateEvent]) {
+        for (index, event) in (pinned + normal).enumerated() where event.position != index {
+            event.position = index
+        }
+        try? modelContext.save()
     }
 
     // 确认删除
@@ -320,6 +443,27 @@ struct HomeScreen: View {
             get: { pendingDelete != nil },
             set: { if !$0 { pendingDelete = nil } }
         )
+    }
+}
+
+// 平板网格的拖拽排序代理：拖到哪张卡上就实时和它换位
+private struct CardReorderDropDelegate: DropDelegate {
+    let target: DateEvent
+    @Binding var draggingEventId: Int64?
+    let onReorder: (Int64, DateEvent) -> Void
+
+    func dropEntered(info: DropInfo) {
+        guard let draggedId = draggingEventId, draggedId != target.id else { return }
+        withAnimation { onReorder(draggedId, target) }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggingEventId = nil
+        return true
     }
 }
 
